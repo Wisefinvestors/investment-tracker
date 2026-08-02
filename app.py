@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import datetime
 import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
 import gspread
 
@@ -114,34 +115,55 @@ def fetch_transactions():
                 pass
     return pd.DataFrame()
 
-# --- LIVE IPO FETCHING ENGINE ---
-@st.cache_data(ttl=3600)
-def fetch_live_ipos():
+# --- DYNAMIC LATEST IPO & LIVE GMP SCRAPER ---
+@st.cache_data(ttl=1800) # Auto refresh every 30 mins
+def fetch_live_ipos_and_gmp():
+    ipo_dict = {}
+    
+    # Primary Stream Scraper (IPO Premium / Aggregator Data)
     try:
-        url = "https://api.ipoji.com/v1/ipos"
-        res = requests.get(url, timeout=5)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        url = "https://www.investorgain.com/report/live-ipo-gmp/331/"
+        res = requests.get(url, headers=headers, timeout=6)
+        
         if res.status_code == 200:
-            data = res.json()
-            ipo_dict = {}
-            for item in data.get("ipos", []):
-                name = item.get("name")
-                ipo_dict[name] = {
-                    "price": float(item.get("cutOffPrice", 100)),
-                    "lot": int(item.get("lotSize", 14))
-                }
-            if ipo_dict:
-                return ipo_dict
+            soup = BeautifulSoup(res.text, 'html.parser')
+            table = soup.find('table')
+            if table:
+                rows = table.find_all('tr')[1:]
+                for row in rows[:15]: # Latest 15 active IPOs
+                    cols = row.find_all('td')
+                    if len(cols) >= 6:
+                        name = cols[0].text.strip()
+                        price_str = cols[2].text.strip().replace("₹", "").replace(",", "")
+                        gmp_str = cols[3].text.strip().replace("₹", "").replace(",", "")
+                        
+                        try:
+                            price = float(price_str) if price_str and price_str != '--' else 100.0
+                        except ValueError:
+                            price = 100.0
+                            
+                        try:
+                            gmp = float(gmp_str) if gmp_str and gmp_str != '--' else 0.0
+                        except ValueError:
+                            gmp = 0.0
+                            
+                        lot = 14 if price > 500 else (30 if price > 200 else 100)
+                        
+                        ipo_dict[name] = {
+                            "price": price,
+                            "lot": lot,
+                            "gmp": gmp,
+                            "gain_pct": round((gmp / price) * 100, 2) if price > 0 else 0.0
+                        }
     except Exception:
         pass
-    
-    return {
-        "NTPC Green Energy Limited": {"price": 108.0, "lot": 138},
-        "Swiggy Limited": {"price": 390.0, "lot": 38},
-        "Hyundai Motor India": {"price": 1960.0, "lot": 7},
-        "Other / Manual IPO Entry": {"price": 100.0, "lot": 1}
-    }
+        
+    # Manual Entry Fallback
+    ipo_dict["Other / Manual IPO Entry"] = {"price": 100.0, "lot": 1, "gmp": 0.0, "gain_pct": 0.0}
+    return ipo_dict
 
-live_ipo_data = fetch_live_ipos()
+live_ipo_data = fetch_live_ipos_and_gmp()
 
 # --- TABS ---
 tab_demat, tab_add, tab_check, tab_port, tab_settle = st.tabs([
@@ -194,9 +216,12 @@ with tab_add:
         
         if asset_type == "IPO Bid":
             with col1:
-                selected_ipo = st.selectbox("Select Active IPO", list(live_ipo_data.keys()))
+                selected_ipo = st.selectbox("Select Active / Upcoming IPO", list(live_ipo_data.keys()))
+                
                 default_price = live_ipo_data[selected_ipo]["price"]
                 default_lot = live_ipo_data[selected_ipo]["lot"]
+                live_gmp = live_ipo_data[selected_ipo]["gmp"]
+                gain_pct = live_ipo_data[selected_ipo]["gain_pct"]
                 
                 ipo_name = st.text_input("Custom Name") if selected_ipo == "Other / Manual IPO Entry" else selected_ipo
                 lots = st.number_input("Lots Applied", min_value=1, value=1, step=1)
@@ -217,7 +242,8 @@ with tab_add:
                 
                 total_qty = lots * shares_per_lot
                 total_bid_amt = total_qty * cut_off
-                st.info(f"📌 Bid Amount: **₹{total_bid_amt:,.2f}** | Demat: **{demat_info_str}**")
+                
+                st.info(f"🔥 **Live GMP:** ₹{live_gmp}/share ({gain_pct}% Est. Gain)\n\n📌 **Bid Amount:** ₹{total_bid_amt:,.2f} | **Demat:** {demat_info_str}")
                 
                 ipo_status = st.selectbox("ASBA Status", ["Funds Blocked / Applied", "Allotted", "Un-Allotted (Refunded)"])
                 interest_rate = st.number_input("Interest Rate (% p.a.)", min_value=0.0, value=st.session_state["user_rate"], step=0.5)
@@ -227,7 +253,7 @@ with tab_add:
             qty_val = total_qty
             price_val = cut_off
             total_amt_val = total_bid_amt
-            note_val = f"IPO ({lots} Lots) | {demat_info_str}"
+            note_val = f"IPO ({lots} Lots) | GMP: ₹{live_gmp} | {demat_info_str}"
 
         else:
             with col1:
@@ -248,7 +274,6 @@ with tab_add:
         if submit and ticker_val:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             user = st.session_state["current_user"]
-            # 15 Column Row Structure
             new_row = [
                 timestamp, str(inv_date), user, asset_type, ticker_val, 
                 qty_val, price_val, total_amt_val, interest_rate, ipo_status, 
@@ -275,49 +300,42 @@ with tab_check:
     df_raw = fetch_transactions()
     if not df_raw.empty:
         st.markdown("##### 📈 Update Allotment / Record Sale")
-        
-        # Filter active IPOs or Holdings
-        df_display = df_raw.copy()
-        st.dataframe(df_display[["Date", "User", "Asset_Class", "Ticker", "Qty", "Buy_Price", "Total_Amount", "IPO_Status", "Is_Sold", "Sell_Price"]], use_container_width=True)
+        st.dataframe(df_raw[["Date", "User", "Asset_Class", "Ticker", "Qty", "Buy_Price", "Total_Amount", "IPO_Status", "Is_Sold", "Sell_Price"]], use_container_width=True)
         
         st.markdown("---")
-        st.markdown("##### 🏷️ Sale Entry / Realize Profit")
+        st.markdown("##### 💰 Sale Entry / Realize Profit")
         with st.form("sell_shares_form"):
             col_s1, col_s2, col_s3 = st.columns(3)
             with col_s1:
-                sell_ticker = st.text_input("Ticker / IPO Name to Sell (Exact Match)").upper().strip()
+                sell_ticker = st.text_input("Ticker / IPO Name to Sell").upper().strip()
             with col_s2:
                 sell_price = st.number_input("Selling Price per Share (₹)", min_value=0.0, value=200.0, step=1.0)
             with col_s3:
                 sell_date = st.date_input("Sell Date", datetime.date.today())
                 
-            btn_sell = st.form_submit_button("💰 Record Share Sale & Realize P&L", type="primary")
+            btn_sell = st.form_submit_button("💰 Record Share Sale", type="primary")
             
             if btn_sell and sell_ticker:
                 if connected and sheet_trans:
-                    # Append sell record as negative adjustment or sold tag
                     user = st.session_state["current_user"]
                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
                     sell_row = [
                         timestamp, str(sell_date), user, "Shares / Stock", sell_ticker, 
                         0, sell_price, 0.0, 0.0, "Sold", 0, f"SOLD on {sell_date}", "YES", sell_price, str(sell_date)
                     ]
                     sheet_trans.append_row(sell_row)
-                    st.success(f"Successfully recorded sale for {sell_ticker} at ₹{sell_price}!")
+                    st.success(f"Successfully recorded sale for {sell_ticker}!")
                     st.rerun()
 
 # --- TAB 4: PORTFOLIO & LIVE P&L ---
 with tab_port:
     st.subheader("📊 Live Portfolio (Including Allotted IPOs)")
-    
     df = fetch_transactions()
     if not df.empty:
         df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
         df["Buy_Price"] = pd.to_numeric(df["Buy_Price"], errors="coerce").fillna(0)
         df["Total_Amount"] = pd.to_numeric(df["Total_Amount"], errors="coerce").fillna(0)
         
-        # Logic: Show Shares OR IPOs that are "Allotted"
         portfolio_df = df[(df["Asset_Class"] == "Shares / Stock") | (df["IPO_Status"] == "Allotted")]
         
         def get_live_price(symbol):
@@ -338,7 +356,7 @@ with tab_port:
             asset = row.get("Asset_Class", "")
             is_sold = str(row.get("Is_Sold", "NO")).upper()
             
-            if is_sold != "YES": # Only active unsold shares
+            if is_sold != "YES":
                 curr_price = get_live_price(ticker) or buy_price
                 curr_val = qty * curr_price
                 pnl = curr_val - invested
@@ -371,13 +389,10 @@ with tab_port:
             
             st.markdown("---")
             st.dataframe(res_df, use_container_width=True)
-        else:
-            st.info("No active allotted IPOs or stock holdings in portfolio.")
 
 # --- TAB 5: DYNAMIC INTEREST & PROFIT LEDGER ---
 with tab_settle:
-    st.subheader("🤝 Dynamic ASBA Interest & Realized Profit Settlement")
-    
+    st.subheader("🤝 Dynamic ASBA Interest & Settlement")
     df_settle = fetch_transactions()
     if not df_settle.empty:
         calc_date = st.date_input("Settlement Target Date", datetime.date.today())
@@ -397,9 +412,6 @@ with tab_settle:
             ipo_st = row.get("IPO_Status", "")
             
             days_blocked = (calc_date - inv_date).days if calc_date >= inv_date else 0
-            
-            # If Allotted, Capital is converted to Shares (Interest stops)
-            # If Un-allotted, interest accrues till refund
             accrued_interest = (amt * rate * days_blocked) / (100 * 365) if ipo_st != "Allotted" else 0.0
             
             settle_records.append({
@@ -416,7 +428,6 @@ with tab_settle:
         st.dataframe(s_df, use_container_width=True)
         
         st.markdown("---")
-        st.markdown("#### 💰 Investor Wise Payout Summary")
         summary = s_df.groupby("Investor").agg({
             "Principal (₹)": "sum",
             "Accrued Interest (₹)": "sum"
