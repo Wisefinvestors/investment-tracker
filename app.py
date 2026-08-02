@@ -1,12 +1,14 @@
 import streamlit as st
 import pandas as pd
 import datetime
-import yfinance as yf
 import gspread
+import yfinance as yf
 
 st.set_page_config(page_title="Wise Finvestors", layout="wide")
 
-# --- GOOGLE SHEETS CONNECTOR ---
+# =========================================================
+# GOOGLE SHEET CONNECTION
+# =========================================================
 @st.cache_resource
 def get_gspread_client():
     return gspread.service_account_from_dict(st.secrets["gcp_service_account"])
@@ -14,56 +16,138 @@ def get_gspread_client():
 connected = False
 sheet_trans = None
 sheet_users = None
-sheet_demat = None
+sheet_settle = None
 
 try:
     client = get_gspread_client()
-    db_sheet = client.open("Investment_Database")
-    sheet_trans = db_sheet.worksheet("Transactions")
-    sheet_users = db_sheet.worksheet("Users_List")
-    try:
-        sheet_demat = db_sheet.worksheet("Demat_Accounts")
-    except Exception:
-        sheet_demat = None
+    db = client.open("Investment_Database")
+    sheet_trans = db.worksheet("Transactions")
+    sheet_users = db.worksheet("Users_List")
+    sheet_settle = db.worksheet("Settlements")
     connected = True
-except Exception:
+except Exception as e:
     connected = False
+    conn_error = str(e)
 
-# --- FETCH USERS ---
+# Column order in Transactions sheet (1-indexed for gspread updates)
+COLS = ["Timestamp", "Date", "User", "Asset_Class", "Ticker", "Qty", "Buy_Price",
+        "Total_Amount", "Interest_Rate", "Status", "Unblock_Date", "Last_Settled_Date", "Note"]
+COL_IDX = {name: i + 1 for i, name in enumerate(COLS)}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def safe_float(val, default=0.0):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_date(val, fallback):
+    """Parse a YYYY-MM-DD string into a date object; return fallback if blank/invalid."""
+    if not val:
+        return fallback
+    try:
+        return datetime.datetime.strptime(str(val).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return fallback
+
+
+def fetch_transactions():
+    """Always pulls fresh data - no caching, so entries show up immediately."""
+    if not (connected and sheet_trans):
+        return pd.DataFrame(columns=COLS)
+    try:
+        values = sheet_trans.get_all_values()
+    except Exception:
+        return pd.DataFrame(columns=COLS)
+
+    if len(values) < 2:
+        return pd.DataFrame(columns=COLS)
+
+    headers = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=headers)
+
+    # Ensure every expected column exists even if sheet is missing one
+    for c in COLS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["Qty"] = df["Qty"].apply(lambda x: safe_float(x, 0.0))
+    df["Buy_Price"] = df["Buy_Price"].apply(lambda x: safe_float(x, 0.0))
+    df["Total_Amount"] = df["Total_Amount"].apply(lambda x: safe_float(x, 0.0))
+    df["Interest_Rate"] = df["Interest_Rate"].apply(lambda x: safe_float(x, 0.0))
+    return df
+
+
+def append_transaction(row_dict):
+    new_row = [row_dict.get(c, "") for c in COLS]
+    sheet_trans.append_row(new_row)
+
+
+def update_transaction_cell(timestamp_value, column_name, new_value):
+    """Finds the row by its unique Timestamp and updates one cell."""
+    try:
+        cell = sheet_trans.find(timestamp_value)
+        sheet_trans.update_cell(cell.row, COL_IDX[column_name], new_value)
+        return True
+    except Exception:
+        return False
+
+
+def get_live_price(symbol):
+    try:
+        if "." not in symbol:
+            symbol = symbol + ".NS"
+        stock = yf.Ticker(symbol)
+        price = stock.fast_info.last_price
+        return float(price) if price else None
+    except Exception:
+        return None
+
+
+# =========================================================
+# USERS
+# =========================================================
 USERS = {}
 if connected and sheet_users:
     try:
-        user_records = sheet_users.get_all_records()
-        for row in user_records:
+        for row in sheet_users.get_all_records():
             mob = str(row.get("Mobile", "")).strip().replace(".0", "")
-            pin = str(row.get("PIN", "")).strip().replace(".0", "")
+            pin = str(row.get("PIN", "")).strip()
             name = str(row.get("Name", "")).strip()
-            rate = row.get("Interest_Rate", 10.0)
+            rate = safe_float(row.get("Interest_Rate", 10.0), 10.0)
             if mob:
-                USERS[mob] = {
-                    "name": name,
-                    "pin": pin,
-                    "default_rate": float(rate) if rate else 10.0
-                }
+                USERS[mob] = {"name": name, "pin": pin, "default_rate": rate}
     except Exception:
         pass
 
 if not USERS:
-    USERS = {"9254893645": {"name": "Ashish", "pin": "1234", "default_rate": 10.0}}
+    USERS = {"9999911111": {"name": "Admin", "pin": "1234", "default_rate": 10.0}}
 
-# --- LOGIN & SESSION STABILITY ---
+
+# =========================================================
+# LOGIN
+# =========================================================
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
-if "current_user" not in st.session_state:
     st.session_state["current_user"] = None
-if "user_rate" not in st.session_state:
     st.session_state["user_rate"] = 10.0
 
 if not st.session_state["logged_in"]:
     st.title("🔐 Wise Finvestors - Login")
-    mobile = st.text_input("Mobile Number", key="login_mob").strip()
-    pin = st.text_input("PIN / Password", type="password", key="login_pin").strip()
-    
+
+    if connected:
+        st.success("🟢 Connected to Google Sheet Database")
+    else:
+        st.error(f"⚠️ Could not connect to Google Sheet. Details: {conn_error}")
+
+    mobile = st.text_input("Mobile Number").strip()
+    pin = st.text_input("PIN / Password", type="password").strip()
+
     if st.button("Login", type="primary"):
         if mobile in USERS and USERS[mobile]["pin"] == pin:
             st.session_state["logged_in"] = True
@@ -74,7 +158,9 @@ if not st.session_state["logged_in"]:
             st.error("Invalid Mobile Number or PIN!")
     st.stop()
 
-# --- SIDEBAR ---
+# =========================================================
+# LOGGED-IN APP
+# =========================================================
 st.sidebar.markdown(f"👤 Logged in: **{st.session_state['current_user']}**")
 if st.sidebar.button("Logout"):
     st.session_state["logged_in"] = False
@@ -83,283 +169,282 @@ if st.sidebar.button("Logout"):
 
 st.title("📈 Wise Finvestors")
 
-# --- FETCH DEMAT ACCOUNTS ---
-def load_demat_accounts():
-    if connected and sheet_demat:
-        try:
-            records = sheet_demat.get_all_records()
-            if records:
-                return pd.DataFrame(records)
-        except Exception:
-            pass
-    return pd.DataFrame(columns=["User", "Holder_Name", "PAN", "BO_ID", "UPI_ID", "Broker_Name"])
-
-df_demat = load_demat_accounts()
-
-# --- FETCH TRANSACTIONS SAFELY ---
-def fetch_transactions():
-    if connected and sheet_trans:
-        try:
-            records = sheet_trans.get_all_records()
-            return pd.DataFrame(records)
-        except Exception:
-            try:
-                data = sheet_trans.get_all_values()
-                if len(data) > 1:
-                    headers = data[0]
-                    return pd.DataFrame(data[1:], columns=headers)
-            except Exception:
-                pass
-    return pd.DataFrame()
-
-# --- SIMPLIFIED TABS ---
-tab_add, tab_ledger, tab_port, tab_demat = st.tabs([
-    "➕ Add Entry / IPO Bid", 
-    "🤝 Blocked Funds & Monthly Settlement",
-    "📊 Stock Portfolio (Averaged)", 
-    "👥 Demat Profiles"
+tab_add, tab_ipo, tab_portfolio, tab_settle = st.tabs([
+    "➕ Add Entry",
+    "🔓 IPO Block / Unblock",
+    "📊 Portfolio",
+    "🤝 Monthly Settlement"
 ])
 
-# --- TAB 1: ADD ENTRY / IPO BID ---
+# ---------------------------------------------------------
+# TAB 1: ADD ENTRY
+# ---------------------------------------------------------
 with tab_add:
-    st.subheader("➕ Record Investment / IPO Bid")
-    asset_type = st.radio("Entry Type:", ["IPO Bid", "Shares / SME Stock"], horizontal=True)
+    st.subheader("Record a New Entry")
+    asset_type = st.radio(
+        "Type of Entry:",
+        ["Shares / Stock", "IPO Applied", "Real Estate", "Mutual Fund"],
+        horizontal=True
+    )
     st.markdown("---")
-    
-    with st.form("main_entry_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        
-        if asset_type == "IPO Bid":
-            with col1:
-                ipo_name = st.text_input("IPO Name / Ticker", placeholder="e.g. Swiggy IPO").strip()
-                bid_amount = st.number_input("Total Blocked Amount (₹)", min_value=0.0, value=150000.0, step=1000.0)
-                inv_date = st.date_input("Application / Block Date", datetime.date.today())
-                
-            with col2:
-                user_demats = df_demat[df_demat["User"] == st.session_state["current_user"]] if not df_demat.empty else pd.DataFrame()
-                if not user_demats.empty:
-                    demat_opts = [f"{row['Holder_Name']} ({row['Broker_Name']})" for idx, row in user_demats.iterrows()]
-                    selected_demat_idx = st.selectbox("Select Demat Used:", range(len(demat_opts)), format_func=lambda x: demat_opts[x])
-                    chosen_demat = user_demats.iloc[selected_demat_idx]
-                    demat_str = f"{chosen_demat['Holder_Name']} - {chosen_demat['Broker_Name']}"
-                else:
-                    demat_str = "Default Demat"
-                    st.info("💡 Demat select karne ke liye Tab 4 mein Demat add karein.")
-                
-                fund_status = st.selectbox("Fund Status:", ["Funds Blocked", "Unblocked / Settled", "Allotted"])
-                interest_rate = st.number_input("Interest Rate (% p.a.)", min_value=0.0, value=st.session_state["user_rate"], step=0.5)
-                note_val = st.text_input("Note / Ref", value=f"Demat: {demat_str}")
-                
-            qty_val = 1
-            price_val = bid_amount
-            total_amt_val = bid_amount
-            
-        else:
-            with col1:
-                ipo_name = st.text_input("Stock Ticker / Symbol", placeholder="e.g. HFCL.NS, TATAMOTORS.NS").upper().strip()
-                qty_val = st.number_input("Quantity Purchased", min_value=1.0, value=100.0, step=1.0)
-                price_val = st.number_input("Buy Price per Share (₹)", min_value=0.0, value=150.0, step=1.0)
-                
-            with col2:
-                total_amt_val = qty_val * price_val
-                st.info(f"📌 Total Investment: **₹{total_amt_val:,.2f}**")
-                inv_date = st.date_input("Purchase Date", datetime.date.today())
-                fund_status = "Direct Holding"
-                interest_rate = 0.0
-                note_val = "Stock Purchase"
 
-        submit = st.form_submit_button("🚀 Save Entry to Sheet", type="primary")
-        
-        if submit and ipo_name:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            user = st.session_state["current_user"]
-            
-            # Row structure (15 columns compatible with Google Sheets)
-            new_row = [
-                timestamp, str(inv_date), user, asset_type, ipo_name, 
-                qty_val, price_val, total_amt_val, interest_rate, fund_status, 
-                0, note_val, "NO", 0.0, ""
-            ]
-            
-            if connected and sheet_trans:
-                sheet_trans.append_row(new_row)
-                st.success(f"✅ Saved entry for {ipo_name} successfully!")
+    with st.form("add_entry_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+
+        if asset_type == "Shares / Stock":
+            with col1:
+                ticker = st.text_input("Ticker (e.g. HFCL.NS, TATAMOTORS.NS)").upper().strip()
+                qty = st.number_input("Quantity", min_value=0.01, value=1.0, step=1.0)
+                buy_price = st.number_input("Buy Price per Share (₹)", min_value=0.0, value=0.0, step=1.0)
+            with col2:
+                total_amount = qty * buy_price
+                st.text_input("Total Amount (auto)", value=f"₹ {total_amount:,.2f}", disabled=True)
+                interest_rate = st.number_input("Interest Rate (% p.a., 0 if self-funded)",
+                                                 min_value=0.0, value=0.0, step=0.5)
+                inv_date = st.date_input("Purchase Date", datetime.date.today())
+            note = ""
+            status = "Active"
+            unblock_date = ""
+
+        elif asset_type == "IPO Applied":
+            with col1:
+                ticker = st.text_input("IPO Name").strip()
+                total_amount = st.number_input("Amount Blocked (₹)", min_value=0.0, value=0.0, step=1000.0)
+            with col2:
+                interest_rate = st.number_input("Interest Rate (% p.a.)",
+                                                 min_value=0.0, value=st.session_state["user_rate"], step=0.5)
+                inv_date = st.date_input("Application Date", datetime.date.today())
+            qty = 0
+            buy_price = 0
+            note = "IPO application - funds blocked"
+            status = "Blocked"
+            unblock_date = ""
+
+        else:  # Real Estate / Mutual Fund
+            with col1:
+                ticker = st.text_input("Details (e.g. Plot Advance, Fund Name)").strip()
+                total_amount = st.number_input("Amount (₹)", min_value=0.0, value=0.0, step=1000.0)
+            with col2:
+                interest_rate = st.number_input("Interest Rate (% p.a.)",
+                                                 min_value=0.0, value=st.session_state["user_rate"], step=0.5)
+                inv_date = st.date_input("Date", datetime.date.today())
+            qty = 0
+            buy_price = 0
+            note = ""
+            status = "Active"
+            unblock_date = ""
+
+        submit = st.form_submit_button("🚀 Save Entry", type="primary")
+
+        if submit:
+            if not ticker:
+                st.error("Please enter a name/ticker/details field.")
+            elif not connected:
+                st.error("Sheet not connected - cannot save.")
+            else:
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                row = {
+                    "Timestamp": timestamp,
+                    "Date": str(inv_date),
+                    "User": st.session_state["current_user"],
+                    "Asset_Class": asset_type,
+                    "Ticker": ticker,
+                    "Qty": qty,
+                    "Buy_Price": buy_price,
+                    "Total_Amount": total_amount,
+                    "Interest_Rate": interest_rate,
+                    "Status": status,
+                    "Unblock_Date": unblock_date,
+                    "Last_Settled_Date": str(inv_date),
+                    "Note": note
+                }
+                append_transaction(row)
+                st.success(f"✅ Saved: {asset_type} - {ticker} (₹{total_amount:,.2f})")
                 st.rerun()
 
-# --- TAB 2: BLOCKED FUNDS & MONTHLY SETTLEMENT ---
-with tab_ledger:
-    st.subheader("🤝 Blocked Funds Tracker & Interest Calculation")
-    
-    df_raw = fetch_transactions()
-    if not df_raw.empty:
-        # Filter IPO Bids
-        df_ipo = df_raw[df_raw["Asset_Class"] == "IPO Bid"].copy()
-        
-        if not df_ipo.empty:
-            calc_target_date = st.date_input("Select Settlement Target Date", datetime.date.today())
-            
-            records = []
-            for idx, row in df_ipo.iterrows():
-                try:
-                    b_date = datetime.datetime.strptime(str(row["Date"]), "%Y-%m-%d").date()
-                except Exception:
-                    b_date = calc_target_date
-                    
-                amt = float(row.get("Total_Amount", 0))
-                rate = float(row.get("Interest_Rate", 10))
-                status = str(row.get("IPO_Status", "Funds Blocked"))
-                
-                # Interest calculates only while status is 'Funds Blocked'
-                if status == "Funds Blocked":
-                    days = (calc_target_date - b_date).days if calc_target_date >= b_date else 0
-                    interest = (amt * rate * days) / (100 * 365)
+# ---------------------------------------------------------
+# TAB 2: IPO BLOCK / UNBLOCK MANAGER
+# ---------------------------------------------------------
+with tab_ipo:
+    st.subheader("🔓 Manage IPO Applications")
+    st.caption("When your funds get released (allotted or refunded), mark it Unblocked here. "
+               "Interest stops accruing from the unblock date you enter.")
+
+    df_all = fetch_transactions()
+    df_ipo = df_all[df_all["Asset_Class"] == "IPO Applied"].copy()
+
+    if df_ipo.empty:
+        st.info("No IPO applications recorded yet.")
+    else:
+        display_cols = ["Date", "User", "Ticker", "Total_Amount", "Interest_Rate", "Status", "Unblock_Date"]
+        st.dataframe(df_ipo[display_cols], use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("##### Mark an Application as Unblocked")
+
+        blocked_df = df_ipo[df_ipo["Status"] == "Blocked"]
+        if blocked_df.empty:
+            st.info("No entries currently marked Blocked.")
+        else:
+            options = {}
+            for _, r in blocked_df.iterrows():
+                label = f"{r['User']} | {r['Ticker']} | ₹{r['Total_Amount']:,.0f} | Applied {r['Date']}"
+                options[label] = r["Timestamp"]
+
+            chosen_label = st.selectbox("Select IPO Entry", list(options.keys()))
+            unblock_d = st.date_input("Unblock Date (allotment/refund date)", datetime.date.today())
+
+            if st.button("🔓 Mark Unblocked", type="primary"):
+                ts = options[chosen_label]
+                ok1 = update_transaction_cell(ts, "Status", "Unblocked")
+                ok2 = update_transaction_cell(ts, "Unblock_Date", str(unblock_d))
+                if ok1 and ok2:
+                    st.success("Marked as Unblocked. Interest will stop accruing from this date.")
+                    st.rerun()
                 else:
-                    days = 0
-                    interest = 0.0
-                    
-                records.append({
-                    "Date": row.get("Date"),
-                    "User": row.get("User"),
-                    "IPO Name": row.get("Ticker"),
-                    "Blocked Amt (₹)": amt,
-                    "Rate (% p.a.)": rate,
-                    "Status": status,
-                    "Days Blocked": days,
-                    "Accrued Interest (₹)": round(interest, 2),
-                    "Note": row.get("Note")
-                })
-                
-            df_calc = pd.DataFrame(records)
-            
-            # Metrics
-            tot_blocked = df_calc[df_calc["Status"] == "Funds Blocked"]["Blocked Amt (₹)"].sum()
-            tot_interest = df_calc["Accrued Interest (₹)"].sum()
-            
-            c1, c2 = st.columns(2)
-            c1.metric("Currently Blocked Capital", f"₹{tot_blocked:,.2f}")
-            c2.metric(f"Total Interest (till {calc_target_date})", f"₹{tot_interest:,.2f}")
-            
-            st.markdown("---")
-            st.markdown("##### 📜 Live Blocked Entries & Status Update")
-            st.dataframe(df_calc, use_container_width=True)
-            
-            st.markdown("---")
-            st.markdown("##### 🔄 Change Fund Status (Unblock / Allot)")
-            
-            # Quick status update controls
-            with st.form("status_update_form"):
-                col_u1, col_u2 = st.columns(2)
-                with col_u1:
-                    selected_ipo_name = st.selectbox("Select Entry", df_calc["IPO Name"].unique())
-                with col_u2:
-                    new_status = st.selectbox("New Status", ["Unblocked / Settled", "Allotted", "Funds Blocked"])
-                    
-                btn_update = st.form_submit_button("Update Status in Sheet", type="primary")
-                
-                if btn_update and connected and sheet_trans:
-                    # Fetch fresh cells and update status column
-                    all_rows = sheet_trans.get_all_values()
-                    for r_idx, r_data in enumerate(all_rows[1:], start=2):
-                        if len(r_data) >= 10 and r_data[4] == selected_ipo_name:
-                            sheet_trans.update_cell(r_idx, 10, new_status) # Col 10 = IPO_Status
-                    st.success(f"Status for {selected_ipo_name} updated to {new_status}!")
-                    st.rerun()
-        else:
-            st.info("No IPO bids recorded yet.")
+                    st.error("Could not update the sheet. Please check the connection and try again.")
 
-# --- TAB 3: STOCK PORTFOLIO (AVERAGED) ---
-with tab_port:
-    st.subheader("📊 Stock Portfolio (Weighted Average Costing)")
-    
-    df_raw = fetch_transactions()
-    if not df_raw.empty:
-        # Stock entries + Allotted IPOs
-        df_stocks = df_raw[(df_raw["Asset_Class"] == "Shares / SME Stock") | (df_raw["IPO_Status"] == "Allotted")].copy()
-        
-        if not df_stocks.empty:
-            df_stocks["Qty"] = pd.to_numeric(df_stocks["Qty"], errors="coerce").fillna(0)
-            df_stocks["Total_Amount"] = pd.to_numeric(df_stocks["Total_Amount"], errors="coerce").fillna(0)
-            
-            # Group by Ticker for Weighted Average Price
-            grouped = df_stocks.groupby("Ticker").agg({
-                "Qty": "sum",
-                "Total_Amount": "sum"
-            }).reset_index()
-            
-            grouped["Avg Buy Price (₹)"] = grouped["Total_Amount"] / grouped["Qty"]
-            
-            def fetch_stock_price(symbol):
+# ---------------------------------------------------------
+# TAB 3: PORTFOLIO (Weighted Average + Live P&L)
+# ---------------------------------------------------------
+with tab_portfolio:
+    st.subheader("📊 Portfolio")
+
+    df_all = fetch_transactions()
+
+    st.markdown("##### 📈 Shares / Stock Holdings (Weighted Average Cost)")
+    df_shares = df_all[df_all["Asset_Class"] == "Shares / Stock"].copy()
+
+    if df_shares.empty:
+        st.info("No stock holdings recorded yet.")
+    else:
+        grouped = df_shares.groupby(["User", "Ticker"]).agg(
+            Total_Qty=("Qty", "sum"),
+            Total_Invested=("Total_Amount", "sum")
+        ).reset_index()
+        grouped = grouped[grouped["Total_Qty"] > 0]
+        grouped["Avg_Buy_Price"] = grouped["Total_Invested"] / grouped["Total_Qty"]
+
+        rows = []
+        for _, r in grouped.iterrows():
+            live_price = get_live_price(r["Ticker"])
+            if live_price is None:
+                live_price = r["Avg_Buy_Price"]
+            current_value = r["Total_Qty"] * live_price
+            pnl = current_value - r["Total_Invested"]
+            pnl_pct = (pnl / r["Total_Invested"] * 100) if r["Total_Invested"] > 0 else 0
+            rows.append({
+                "User": r["User"],
+                "Ticker": r["Ticker"],
+                "Qty": round(r["Total_Qty"], 2),
+                "Avg Buy Price (₹)": round(r["Avg_Buy_Price"], 2),
+                "Invested (₹)": round(r["Total_Invested"], 2),
+                "Live Price (₹)": round(live_price, 2),
+                "Current Value (₹)": round(current_value, 2),
+                "Unrealized P&L (₹)": round(pnl, 2),
+                "P&L %": f"{pnl_pct:.2f}%"
+            })
+
+        res_df = pd.DataFrame(rows)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Invested", f"₹{res_df['Invested (₹)'].sum():,.2f}")
+        c2.metric("Current Value", f"₹{res_df['Current Value (₹)'].sum():,.2f}")
+        c3.metric("Unrealized P&L", f"₹{res_df['Unrealized P&L (₹)'].sum():,.2f}")
+        st.dataframe(res_df, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("##### 🏠 Real Estate / Mutual Fund / IPO Holdings")
+    df_other = df_all[df_all["Asset_Class"].isin(["Real Estate", "Mutual Fund", "IPO Applied"])].copy()
+    if df_other.empty:
+        st.info("No other holdings recorded yet.")
+    else:
+        st.dataframe(
+            df_other[["Date", "User", "Asset_Class", "Ticker", "Total_Amount", "Status"]],
+            use_container_width=True
+        )
+
+# ---------------------------------------------------------
+# TAB 4: MONTHLY SETTLEMENT (non-cumulative)
+# ---------------------------------------------------------
+with tab_settle:
+    st.subheader("🤝 Monthly Interest Settlement")
+    st.caption("Interest is calculated only from each entry's Last Settled Date (not from day one). "
+               "Click 'Settle Now' to lock in this period's interest and reset the counter.")
+
+    calc_date = st.date_input("Calculate Interest Up To", datetime.date.today())
+
+    df_all = fetch_transactions()
+    df_interest = df_all[df_all["Interest_Rate"] > 0].copy()
+
+    if df_interest.empty:
+        st.info("No interest-bearing entries found.")
+    else:
+        pending_rows = []
+        for _, r in df_interest.iterrows():
+            entry_date = safe_date(r["Date"], calc_date)
+            last_settled = safe_date(r["Last_Settled_Date"], entry_date)
+
+            # If an IPO has been unblocked, interest stops at the unblock date
+            end_date = calc_date
+            if r["Asset_Class"] == "IPO Applied" and r["Status"] == "Unblocked":
+                unblock_d = safe_date(r["Unblock_Date"], calc_date)
+                end_date = min(calc_date, unblock_d)
+
+            days = (end_date - last_settled).days
+            days = max(days, 0)
+            interest = (r["Total_Amount"] * r["Interest_Rate"] * days) / (100 * 365)
+
+            pending_rows.append({
+                "Timestamp": r["Timestamp"],
+                "User": r["User"],
+                "Asset": r["Asset_Class"],
+                "Details": r["Ticker"],
+                "Principal (₹)": round(r["Total_Amount"], 2),
+                "ROI (%)": r["Interest_Rate"],
+                "From": str(last_settled),
+                "To": str(end_date),
+                "Days": days,
+                "Pending Interest (₹)": round(interest, 2)
+            })
+
+        pending_df = pd.DataFrame(pending_rows)
+        st.dataframe(pending_df.drop(columns=["Timestamp"]), use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### 💰 Pending Interest by Investor")
+        summary = pending_df.groupby("User").agg(
+            Total_Principal=("Principal (₹)", "sum"),
+            Total_Pending_Interest=("Pending Interest (₹)", "sum")
+        ).reset_index()
+        st.dataframe(summary, use_container_width=True)
+
+        st.markdown("---")
+        if st.button("✅ Settle All Entries Up To This Date", type="primary"):
+            settled_count = 0
+            for _, r in pending_df.iterrows():
+                if r["Pending Interest (₹)"] <= 0 and r["Days"] == 0:
+                    continue
+                # Log the settlement
+                if connected and sheet_settle:
+                    log_row = [
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        r["User"], r["Details"], r["Asset"],
+                        r["From"], r["To"], r["Days"], r["Principal (₹)"], r["Pending Interest (₹)"]
+                    ]
+                    sheet_settle.append_row(log_row)
+                # Reset the counter on the original transaction
+                update_transaction_cell(r["Timestamp"], "Last_Settled_Date", r["To"])
+                settled_count += 1
+            st.success(f"Settled {settled_count} entries. Interest will now accrue fresh from {calc_date}.")
+            st.rerun()
+
+        with st.expander("📜 View Settlement History"):
+            if connected and sheet_settle:
                 try:
-                    if "." not in symbol:
-                        symbol = symbol + ".NS"
-                    ticker = yf.Ticker(symbol)
-                    return ticker.fast_info.last_price
+                    hist = sheet_settle.get_all_records()
+                    if hist:
+                        st.dataframe(pd.DataFrame(hist), use_container_width=True)
+                    else:
+                        st.info("No settlements recorded yet.")
                 except Exception:
-                    return None
-
-            port_data = []
-            for idx, row in grouped.iterrows():
-                sym = str(row["Ticker"]).strip()
-                qty = row["Qty"]
-                invested = row["Total_Amount"]
-                avg_price = row["Avg Buy Price (₹)"]
-                
-                curr_price = fetch_stock_price(sym) or avg_price
-                curr_val = qty * curr_price
-                pnl = curr_val - invested
-                pnl_pct = (pnl / invested) * 100 if invested > 0 else 0
-                
-                port_data.append({
-                    "Stock / SME Security": sym,
-                    "Total Qty": qty,
-                    "Avg Buy Price (₹)": round(avg_price, 2),
-                    "Total Invested (₹)": round(invested, 2),
-                    "Live Price (₹)": round(curr_price, 2),
-                    "Current Value (₹)": round(curr_val, 2),
-                    "Unrealized P&L (₹)": round(pnl, 2),
-                    "Return (%)": f"{round(pnl_pct, 2)}%"
-                })
-                
-            res_portfolio = pd.DataFrame(port_data)
-            
-            t_inv = res_portfolio["Total Invested (₹)"].sum()
-            t_val = res_portfolio["Current Value (₹)"].sum()
-            t_pnl = res_portfolio["Unrealized P&L (₹)"].sum()
-            
-            col_m1, col_m2, col_m3 = st.columns(3)
-            col_m1.metric("Total Stock Investment", f"₹{t_inv:,.2f}")
-            col_m2.metric("Portfolio Value", f"₹{t_val:,.2f}")
-            col_m3.metric("Unrealized Profit/Loss", f"₹{t_pnl:,.2f}", delta=f"{round(t_pnl, 2)}")
-            
-            st.markdown("---")
-            st.dataframe(res_portfolio, use_container_width=True)
-        else:
-            st.info("No stock holdings or allotted shares found.")
-
-# --- TAB 4: DEMAT PROFILES ---
-with tab_demat:
-    st.subheader("👥 Manage Demat Accounts")
-    col_d1, col_d2 = st.columns([1, 1.5])
-    
-    with col_d1:
-        st.markdown("##### ➕ Add Demat Profile")
-        with st.form("add_demat_form", clear_on_submit=True):
-            holder_name = st.text_input("Account Holder Name")
-            pan_no = st.text_input("PAN Number").upper().strip()
-            bo_id = st.text_input("BO ID / Demat No").strip()
-            broker = st.selectbox("Broker", ["Zerodha", "Groww", "AngelOne", "Upstox", "ICICI Direct", "HDFC Securities", "Other"])
-            submit_demat = st.form_submit_button("💾 Save Profile", type="primary")
-            
-            if submit_demat and holder_name and pan_no:
-                if connected and sheet_demat:
-                    new_demat_row = [st.session_state["current_user"], holder_name, pan_no, bo_id, "", broker]
-                    sheet_demat.append_row(new_demat_row)
-                    st.success(f"Added Demat Profile for {holder_name}!")
-                    st.rerun()
-                    
-    with col_d2:
-        st.markdown("##### 📜 Active Profiles")
-        if not df_demat.empty:
-            st.dataframe(df_demat, use_container_width=True)
-        else:
-            st.info("No Demat profiles added yet.")
+                    st.info("Could not load settlement history.")
