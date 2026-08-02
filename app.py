@@ -9,15 +9,17 @@ from oauth2client.service_account import ServiceAccountCredentials
 st.set_page_config(page_title="Partnership Investment Tracker", layout="wide")
 
 # --- GOOGLE SHEETS CONNECTOR ---
+# --- GOOGLE SHEETS CONNECTOR ---
 @st.cache_resource
 def get_gspread_client():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds_dict = json.loads(st.secrets["gcp_service_account"])
+    # Secrets support for triple quote json_key
+    if "json_key" in st.secrets["gcp_service_account"]:
+        creds_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    else:
+        creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     return gspread.authorize(creds)
-
-try:
-    client = get_gspread_client()
     sheet_trans = client.open("Investment_Database").worksheet("Transactions")
     sheet_users = client.open("Investment_Database").worksheet("Users_List")
     sheet_paper = client.open("Investment_Database").worksheet("Paper_Trades")
