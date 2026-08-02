@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import json
 import datetime
+import requests
 import yfinance as yf
 import gspread
 
-st.set_page_config(page_title="Wise Finvestors", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Wise Finvestors", layout="wide")
 
 # --- GOOGLE SHEETS CONNECTOR ---
 @st.cache_resource
@@ -15,18 +16,22 @@ def get_gspread_client():
 connected = False
 sheet_trans = None
 sheet_users = None
-sheet_paper = None
+sheet_demat = None
 
 try:
     client = get_gspread_client()
-    sheet_trans = client.open("Investment_Database").worksheet("Transactions")
-    sheet_users = client.open("Investment_Database").worksheet("Users_List")
-    sheet_paper = client.open("Investment_Database").worksheet("Paper_Trades")
+    db_sheet = client.open("Investment_Database")
+    sheet_trans = db_sheet.worksheet("Transactions")
+    sheet_users = db_sheet.worksheet("Users_List")
+    try:
+        sheet_demat = db_sheet.worksheet("Demat_Accounts")
+    except Exception:
+        sheet_demat = None
     connected = True
-except Exception as e:
+except Exception:
     connected = False
 
-# --- FETCH USERS FROM GOOGLE SHEET ---
+# --- FETCH USERS ---
 USERS = {}
 if connected and sheet_users:
     try:
@@ -42,241 +47,341 @@ if connected and sheet_users:
                     "pin": pin,
                     "default_rate": float(rate) if rate else 10.0
                 }
-    except Exception as e:
+    except Exception:
         pass
 
 if not USERS:
-    USERS = {"9999911111": {"name": "Admin", "pin": "admin123", "default_rate": 10.0}}
+    USERS = {"9254893645": {"name": "Ashish", "pin": "1234", "default_rate": 10.0}}
 
-# --- LOGIN SYSTEM ---
+# --- LOGIN & SESSION STABILITY ---
 if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.current_user = None
+    st.session_state["logged_in"] = False
+if "current_user" not in st.session_state:
+    st.session_state["current_user"] = None
+if "user_rate" not in st.session_state:
+    st.session_state["user_rate"] = 10.0
 
-if not st.session_state.logged_in:
+if not st.session_state["logged_in"]:
     st.title("🔐 Wise Finvestors - Login")
-    
-    if connected:
-        st.success("🟢 Database Online & Connected")
-    else:
-        st.warning("⚠️ Running in Standalone / Offline Mode")
-        
-    mobile = st.text_input("Mobile Number").strip()
-    pin = st.text_input("PIN / Password", type="password").strip()
+    mobile = st.text_input("Mobile Number", key="login_mob").strip()
+    pin = st.text_input("PIN / Password", type="password", key="login_pin").strip()
     
     if st.button("Login", type="primary"):
         if mobile in USERS and USERS[mobile]["pin"] == pin:
-            st.session_state.logged_in = True
-            st.session_state.current_user = USERS[mobile]["name"]
-            st.session_state.user_rate = USERS[mobile]["default_rate"]
+            st.session_state["logged_in"] = True
+            st.session_state["current_user"] = USERS[mobile]["name"]
+            st.session_state["user_rate"] = USERS[mobile]["default_rate"]
             st.rerun()
         else:
             st.error("Invalid Mobile Number or PIN!")
     st.stop()
 
-# --- LOGGED IN DASHBOARD ---
-st.sidebar.markdown(f"👤 Logged in as: **{st.session_state.current_user}**")
+# --- SIDEBAR ---
+st.sidebar.markdown(f"👤 Logged in: **{st.session_state['current_user']}**")
 if st.sidebar.button("Logout"):
-    st.session_state.logged_in = False
+    st.session_state["logged_in"] = False
+    st.session_state["current_user"] = None
     st.rerun()
 
-st.title("📈 Wise Finvestors - Investment & Settlement Dashboard")
+st.title("📈 Wise Finvestors")
 
-# MAIN TABS
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Portfolio & Live Market", 
-    "➕ Add Entry / IPO Bid", 
-    "🤝 Interest & Settlement", 
-    "🧪 Paper Trading", 
-    "📦 Raw Data & JSON"
-])
-
-# --- HELPER FUNCTIONS ---
-def load_transactions():
-    if connected and sheet_trans:
+# --- FETCH DEMAT ACCOUNTS ---
+def load_demat_accounts():
+    if connected and sheet_demat:
         try:
-            records = sheet_trans.get_all_records()
+            records = sheet_demat.get_all_records()
             if records:
-                df = pd.DataFrame(records)
-                df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
-                df['Interest_Rate'] = pd.to_numeric(df['Interest_Rate'], errors='coerce').fillna(10.0)
-                df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-                return df
+                return pd.DataFrame(records)
         except Exception:
             pass
-    return pd.DataFrame(columns=["Timestamp", "Date", "User", "Asset_Class", "Amount", "Interest_Rate", "Note"])
+    return pd.DataFrame(columns=["User", "Holder_Name", "PAN", "BO_ID", "UPI_ID", "Broker_Name"])
 
-def fetch_live_price(ticker):
+df_demat = load_demat_accounts()
+
+# --- LIVE IPO FETCHING ENGINE ---
+@st.cache_data(ttl=3600)
+def fetch_live_ipos():
     try:
-        if not ticker or "." not in ticker:
-            ticker = ticker + ".NS" if ticker else ""
-        stock = yf.Ticker(ticker)
-        fast_info = stock.fast_info
-        return fast_info.last_price
+        url = "https://api.ipoji.com/v1/ipos"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            ipo_dict = {}
+            for item in data.get("ipos", []):
+                name = item.get("name")
+                ipo_dict[name] = {
+                    "price": float(item.get("cutOffPrice", 100)),
+                    "lot": int(item.get("lotSize", 14))
+                }
+            if ipo_dict:
+                return ipo_dict
     except Exception:
-        return None
-
-df_trans = load_transactions()
-
-# --- TAB 1: PORTFOLIO & LIVE MARKET ---
-with tab1:
-    st.subheader("📊 Portfolio Overview")
+        pass
     
-    if df_trans.empty:
-        st.info("No investments recorded yet. Add your first transaction in the next tab!")
-    else:
-        # Top Metrics
-        total_inv = df_trans['Amount'].sum()
-        user_inv = df_trans[df_trans['User'] == st.session_state.current_user]['Amount'].sum()
-        
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Total Group Capital", f"₹{total_inv:,.2f}")
-        col_m2.metric(f"Your Investment ({st.session_state.current_user})", f"₹{user_inv:,.2f}")
-        col_m3.metric("Total Recorded Entries", len(df_trans))
-        
-        st.markdown("---")
-        
-        # Breakdown by User & Asset Class
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("##### Capital Contribution by Investor")
-            user_summary = df_trans.groupby("User")["Amount"].sum().reset_index()
-            st.dataframe(user_summary, use_container_width=True)
+    return {
+        "NTPC Green Energy Limited": {"price": 108.0, "lot": 138},
+        "Swiggy Limited": {"price": 390.0, "lot": 38},
+        "Hyundai Motor India": {"price": 1960.0, "lot": 7},
+        "Other / Manual IPO Entry": {"price": 100.0, "lot": 1}
+    }
+
+live_ipo_data = fetch_live_ipos()
+
+# --- TABS ---
+tab_demat, tab_add, tab_check, tab_port, tab_settle = st.tabs([
+    "👥 Manage Demat Profiles",
+    "➕ Apply IPO / Add Entry", 
+    "🔍 IPO Allotment Hub",
+    "📊 Portfolio & Live P&L", 
+    "🤝 Dynamic Interest & Settlement"
+])
+
+# --- TAB 1: MANAGE DEMAT PROFILES ---
+with tab_demat:
+    st.subheader("👥 Multiple Demat Accounts Directory")
+    st.caption("Add all Demat accounts (Self, Family, Friends) to quickly apply IPOs and check allotments.")
+    
+    col_d1, col_d2 = st.columns([1, 1.5])
+    
+    with col_d1:
+        st.markdown("##### ➕ Add New Demat Account")
+        with st.form("add_demat_form", clear_on_submit=True):
+            holder_name = st.text_input("Account Holder Name (e.g. Ashish Kumar)")
+            pan_no = st.text_input("PAN Card Number").upper().strip()
+            bo_id = st.text_input("BO ID / Demat No (16 Digits)").strip()
+            upi_id = st.text_input("Linked UPI ID (e.g. 9876543210@paytm)").strip()
+            broker = st.selectbox("Broker Name", ["Zerodha", "Groww", "AngelOne", "Upstox", "ICICI Direct", "HDFC Securities", "Other"])
             
-        with c2:
-            st.markdown("##### Capital Allocation by Asset Class")
-            asset_summary = df_trans.groupby("Asset_Class")["Amount"].sum().reset_index()
-            st.dataframe(asset_summary, use_container_width=True)
+            submit_demat = st.form_submit_button("💾 Save Demat Profile", type="primary")
             
-        st.markdown("---")
-        st.markdown("##### 📜 All Recorded Investments")
-        st.dataframe(df_trans.sort_values(by="Date", ascending=False), use_container_width=True)
+            if submit_demat:
+                if not holder_name or not pan_no:
+                    st.error("Holder Name and PAN are required!")
+                elif connected and sheet_demat:
+                    new_demat_row = [st.session_state["current_user"], holder_name, pan_no, bo_id, upi_id, broker]
+                    sheet_demat.append_row(new_demat_row)
+                    st.success(f"Added Demat Profile for {holder_name} ({broker})!")
+                    st.rerun()
+                else:
+                    st.error("Sheet Connection Error or 'Demat_Accounts' tab missing!")
+                    
+    with col_d2:
+        st.markdown("##### 📜 Registered Demat Profiles")
+        if not df_demat.empty:
+            st.dataframe(df_demat, use_container_width=True)
+        else:
+            st.info("No Demat accounts added yet. Use the form on the left to add your first Demat profile.")
 
 # --- TAB 2: ADD ENTRY / IPO BID ---
-with tab2:
-    st.subheader("➕ Record Investment / Apply IPO")
+with tab_add:
+    st.subheader("Record Investment / Apply IPO Bid")
+    asset_type = st.radio("Investment Mode:", ["IPO Bid", "Shares / Stock", "Real Estate", "Mutual Fund"], horizontal=True)
+    st.markdown("---")
     
-    with st.form("investment_form", clear_on_submit=True):
+    with st.form("main_entry_form"):
         col1, col2 = st.columns(2)
-        with col1:
-            asset_type = st.selectbox("Asset Class", ["Shares / Stock", "IPO Bid", "Real Estate", "Mutual Fund", "Expense"])
-            amount = st.number_input("Investment Amount (₹)", min_value=0.0, step=1000.0)
-            interest_rate = st.number_input("Interest Rate (% p.a.)", min_value=0.0, value=st.session_state.user_rate, step=0.5)
         
-        with col2:
-            note = st.text_input("Stock Ticker / Details (e.g. HFCL.NS, TATAMOTORS.NS, IPO Name)")
-            inv_date = st.date_input("Investment Date", datetime.date.today())
-            investor_name = st.selectbox("Investor", list(USERS.keys()), format_func=lambda x: USERS[x]["name"])
+        if asset_type == "IPO Bid":
+            with col1:
+                selected_ipo = st.selectbox("Select Active IPO", list(live_ipo_data.keys()))
+                default_price = live_ipo_data[selected_ipo]["price"]
+                default_lot = live_ipo_data[selected_ipo]["lot"]
+                
+                ipo_name = st.text_input("Custom Name") if selected_ipo == "Other / Manual IPO Entry" else selected_ipo
+                lots = st.number_input("Lots Applied", min_value=1, value=1, step=1)
+                shares_per_lot = st.number_input("Shares/Lot", min_value=1, value=default_lot, step=1)
+                cut_off = st.number_input("Cut-off Price (₹)", min_value=0.0, value=default_price, step=1.0)
+                
+            with col2:
+                # Select Demat Profile for this bid
+                user_demats = df_demat[df_demat["User"] == st.session_state["current_user"]] if not df_demat.empty else pd.DataFrame()
+                
+                if not user_demats.empty:
+                    demat_opts = [f"{row['Holder_Name']} - {row['Broker_Name']} ({row['PAN']})" for idx, row in user_demats.iterrows()]
+                    selected_demat_idx = st.selectbox("Select Demat Account Used:", range(len(demat_opts)), format_func=lambda x: demat_opts[x])
+                    chosen_demat = user_demats.iloc[selected_demat_idx]
+                    demat_info_str = f"Holder: {chosen_demat['Holder_Name']} | PAN: {chosen_demat['PAN']} | BO_ID: {chosen_demat['BO_ID']} | UPI: {chosen_demat['UPI_ID']}"
+                else:
+                    st.warning("⚠️ No Demat accounts found! Go to 'Manage Demat Profiles' tab to add one.")
+                    demat_info_str = "Default Demat Profile"
+                
+                total_qty = lots * shares_per_lot
+                total_bid_amt = total_qty * cut_off
+                st.info(f"📌 **Bid Amount:** ₹{total_bid_amt:,.2f} ({total_qty} Shares)\n\n💳 **Selected Demat Details:**\n{demat_info_str}")
+                
+                ipo_status = st.selectbox("ASBA Status", ["Funds Blocked / Applied", "Allotted", "Un-Allotted (Refunded)"])
+                interest_rate = st.number_input("Interest Rate (% p.a.)", min_value=0.0, value=st.session_state["user_rate"], step=0.5)
+                inv_date = st.date_input("Application Date", datetime.date.today())
+                
+            ticker_val = ipo_name
+            qty_val = total_qty
+            price_val = cut_off
+            total_amt_val = total_bid_amt
+            note_val = f"IPO ({lots} Lots) | {demat_info_str}"
+
+        else:
+            with col1:
+                ticker_val = st.text_input("Stock Ticker (e.g., HFCL.NS, TATAMOTORS.NS)").upper().strip()
+                qty_val = st.number_input("Quantity", min_value=1.0, value=10.0, step=1.0)
+                price_val = st.number_input("Buy Price (₹)", min_value=0.0, value=100.0, step=1.0)
+                
+            with col2:
+                total_amt_val = qty_val * price_val
+                st.info(f"📌 Total Amount: **₹{total_amt_val:,.2f}**")
+                ipo_status = "N/A"
+                interest_rate = st.number_input("Interest Rate (% p.a.)", min_value=0.0, value=st.session_state["user_rate"], step=0.5)
+                inv_date = st.date_input("Transaction Date", datetime.date.today())
+                note_val = "Direct Market Purchase"
+
+        submit = st.form_submit_button("🚀 Save Bid to Sheet", type="primary")
         
-        submit = st.form_submit_button("🚀 Submit Entry to Sheet", type="primary")
-        
-        if submit:
-            user_selected = USERS[investor_name]["name"]
+        if submit and ticker_val:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_row = [timestamp, str(inv_date), user_selected, asset_type, amount, interest_rate, note]
+            user = st.session_state["current_user"]
+            new_row = [timestamp, str(inv_date), user, asset_type, ticker_val, qty_val, price_val, total_amt_val, interest_rate, ipo_status, 0, note_val]
             
             if connected and sheet_trans:
                 sheet_trans.append_row(new_row)
-                st.success(f"✅ Successfully added entry for **{user_selected}** (₹{amount:,.2f})!")
+                st.success(f"✅ Recorded {ticker_val} Bid successfully!")
                 st.rerun()
-            else:
-                st.error("Sheet Connection Error. Unable to save.")
 
-# --- TAB 3: INTEREST & SETTLEMENT ENGINE ---
-with tab3:
-    st.subheader("🤝 Interest & Dynamic Settlement Ledger")
-    st.caption("Calculates exact per-day interest based on individual transaction dates and custom ROI.")
+# --- TAB 3: IPO ALLOTMENT CHECKER ---
+with tab_check:
+    st.subheader("🔍 IPO Allotment Quick Check Hub")
+    st.caption("Copy PAN/BO-ID in 1-click and check status directly on registrar portals.")
     
-    if df_trans.empty:
-        st.info("No entries to calculate settlement.")
-    else:
-        settlement_date = st.date_input("Settlement Calculation Date", datetime.date.today())
-        
-        settlement_data = []
-        for idx, row in df_trans.iterrows():
-            inv_d = row["Date"]
-            amt = row["Amount"]
-            rate = row["Interest_Rate"]
-            user = row["User"]
+    col_reg1, col_reg2, col_reg3, col_reg4 = st.columns(4)
+    col_reg1.link_button("🌐 Link Intime Portal", "https://linkintime.co.in/initial_offer/public-issues.html")
+    col_reg2.link_button("🌐 KFintech Portal", "https://ris.kfintech.com/ipostatus/")
+    col_reg3.link_button("🌐 Bigshare Portal", "https://ipo.bigshareonline.com/ipo_status.html")
+    col_reg4.link_button("🌐 IPO Premium Hub", "https://www.ipopremium.in/")
+    
+    st.markdown("---")
+    st.markdown("##### 📋 Applied IPO Bids & Demat Info")
+    
+    if connected and sheet_trans:
+        records = sheet_trans.get_all_records()
+        if records:
+            df_ipo = pd.DataFrame(records)
+            df_ipo = df_ipo[df_ipo["Asset_Class"] == "IPO Bid"]
             
-            if pd.notnull(inv_d) and inv_d <= settlement_date:
-                days_held = (settlement_date - inv_d).days
-                # Simple per-day accrued interest: (P * R * T) / 365
-                interest_accrued = (amt * rate * days_held) / (100 * 365)
-                total_claim = amt + interest_accrued
+            if not df_ipo.empty:
+                st.dataframe(df_ipo[["Date", "User", "Ticker", "Qty", "Total_Amount", "IPO_Status", "Note"]], use_container_width=True)
             else:
-                days_held = 0
-                interest_accrued = 0.0
-                total_claim = amt
-                
-            settlement_data.append({
-                "Investor": user,
-                "Asset": row["Asset_Class"],
-                "Details": row["Note"],
-                "Principal (₹)": amt,
-                "ROI (% p.a.)": rate,
-                "Holding Days": days_held,
-                "Accrued Interest (₹)": round(interest_accrued, 2),
-                "Total Settlement (₹)": round(total_claim, 2)
-            })
-            
-        settle_df = pd.DataFrame(settlement_data)
-        st.dataframe(settle_df, use_container_width=True)
-        
-        st.markdown("---")
-        st.markdown("#### 💵 Net Investor Payout Summary")
-        summary_payout = settle_df.groupby("Investor").agg({
-            "Principal (₹)": "sum",
-            "Accrued Interest (₹)": "sum",
-            "Total Settlement (₹)": "sum"
-        }).reset_index()
-        st.dataframe(summary_payout, use_container_width=True)
+                st.info("No IPO applications found.")
+        else:
+            st.info("No records in Google Sheet.")
 
-# --- TAB 4: PAPER TRADING SANDBOX ---
-with tab4:
-    st.subheader("🧪 Isolated Paper Trading Sandbox")
-    st.info("Virtual trading space for practice - completely separate from real settlement calculations.")
-    
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        p_ticker = st.text_input("Paper Ticker (e.g. RELIANCE.NS)").upper()
-        p_buy = st.number_input("Virtual Buy Price (₹)", min_value=0.0, step=10.0)
-        p_qty = st.number_input("Quantity", min_value=1, step=1)
-        
-        if st.button("📌 Record Paper Trade"):
-            user = st.session_state.current_user
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            p_row = [timestamp, user, p_ticker, p_buy, p_qty, "OPEN"]
+# --- TAB 4: PORTFOLIO & LIVE P&L ---
+with tab_port:
+    st.subheader("📊 Live Portfolio Analytics")
+    if connected and sheet_trans:
+        records = sheet_trans.get_all_records()
+        if records:
+            df = pd.DataFrame(records)
+            df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+            df["Buy_Price"] = pd.to_numeric(df["Buy_Price"], errors="coerce").fillna(0)
+            df["Total_Amount"] = pd.to_numeric(df["Total_Amount"], errors="coerce").fillna(0)
             
-            if connected and sheet_paper:
-                sheet_paper.append_row(p_row)
-                st.success(f"Recorded Virtual Trade: {p_qty} shares of {p_ticker}")
-                st.rerun()
-            else:
-                st.error("Sheet Connection Error.")
+            def get_live_price(symbol):
+                try:
+                    if "." not in symbol:
+                        symbol = symbol + ".NS"
+                    stock = yf.Ticker(symbol)
+                    return stock.fast_info.last_price
+                except Exception:
+                    return None
+
+            live_data = []
+            for idx, row in df.iterrows():
+                ticker = str(row.get("Ticker", "")).strip()
+                qty = row["Qty"]
+                buy_price = row["Buy_Price"]
+                invested = row["Total_Amount"]
+                asset = row.get("Asset_Class", "")
                 
-    with col_p2:
-        st.markdown("##### 📈 Virtual Positions")
-        if connected and sheet_paper:
-            try:
-                p_records = sheet_paper.get_all_records()
-                if p_records:
-                    st.dataframe(pd.DataFrame(p_records), use_container_width=True)
+                if asset == "Shares / Stock" and ticker:
+                    curr_price = get_live_price(ticker) or buy_price
+                    curr_val = qty * curr_price
+                    pnl = curr_val - invested
+                    pnl_pct = (pnl / invested) * 100 if invested > 0 else 0
                 else:
-                    st.write("No paper trades found.")
-            except Exception:
-                st.write("Unable to fetch paper trades.")
+                    curr_price = buy_price
+                    curr_val = invested
+                    pnl = 0.0
+                    pnl_pct = 0.0
+                    
+                live_data.append({
+                    "Date": row.get("Date"),
+                    "User": row.get("User"),
+                    "Asset": asset,
+                    "Ticker/IPO": ticker,
+                    "Qty": qty,
+                    "Buy Price (₹)": buy_price,
+                    "Invested (₹)": invested,
+                    "Live Price (₹)": round(curr_price, 2),
+                    "Current Value (₹)": round(curr_val, 2),
+                    "Unrealized P&L (₹)": round(pnl, 2),
+                    "P&L %": f"{round(pnl_pct, 2)}%"
+                })
+                
+            res_df = pd.DataFrame(live_data)
+            tot_inv = res_df["Invested (₹)"].sum()
+            tot_val = res_df["Current Value (₹)"].sum()
+            tot_pnl = res_df["Unrealized P&L (₹)"].sum()
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Investment", f"₹{tot_inv:,.2f}")
+            m2.metric("Current Portfolio Value", f"₹{tot_val:,.2f}")
+            m3.metric("Total Unrealized P&L", f"₹{tot_pnl:,.2f}", delta=f"{round(tot_pnl, 2)}")
+            
+            st.markdown("---")
+            st.dataframe(res_df, use_container_width=True)
 
-# --- TAB 5: RAW DATA & JSON BACKUP ---
-with tab5:
-    st.subheader("📦 Database JSON Backup & Raw Logs")
-    if not df_trans.empty:
-        json_str = df_trans.to_json(orient="records", date_format="iso", indent=4)
-        st.download_button(
-            label="📥 Download Database Backup (JSON)",
-            data=json_str,
-            file_name=f"wise_finvestors_backup_{datetime.date.today()}.json",
-            mime="application/json",
-            type="primary"
-        )
-        st.json(df_trans.to_dict(orient="records"))
+# --- TAB 5: DYNAMIC INTEREST & ASBA SETTLEMENT ---
+with tab_settle:
+    st.subheader("🤝 Dynamic ASBA & Capital Interest Ledger")
+    
+    if connected and sheet_trans:
+        records = sheet_trans.get_all_records()
+        if records:
+            df_settle = pd.DataFrame(records)
+            calc_date = st.date_input("Settlement Target Date", datetime.date.today())
+            
+            settle_records = []
+            for idx, row in df_settle.iterrows():
+                try:
+                    inv_date = datetime.datetime.strptime(str(row["Date"]), "%Y-%m-%d").date()
+                except Exception:
+                    inv_date = calc_date
+                    
+                amt = float(row.get("Total_Amount", 0))
+                rate = float(row.get("Interest_Rate", 10))
+                user = row.get("User", "")
+                asset = row.get("Asset_Class", "")
+                ticker = row.get("Ticker", "")
+                
+                days_blocked = (calc_date - inv_date).days if calc_date >= inv_date else 0
+                accrued_interest = (amt * rate * days_blocked) / (100 * 365)
+                
+                settle_records.append({
+                    "Investor": user,
+                    "Asset Type": asset,
+                    "Details": ticker,
+                    "Principal (₹)": amt,
+                    "ROI (% p.a.)": rate,
+                    "Days Blocked": days_blocked,
+                    "Accrued Interest (₹)": round(accrued_interest, 2),
+                    "Total Claim Value (₹)": round(amt + accrued_interest, 2)
+                })
+                
+            s_df = pd.DataFrame(settle_records)
+            st.dataframe(s_df, use_container_width=True)
+            
+            st.markdown("---")
+            summary = s_df.groupby("Investor").agg({
+                "Principal (₹)": "sum",
+                "Accrued Interest (₹)": "sum",
+                "Total Claim Value (₹)": "sum"
+            }).reset_index()
+            st.dataframe(summary, use_container_width=True)
