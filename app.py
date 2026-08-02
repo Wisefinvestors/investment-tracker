@@ -4,21 +4,14 @@ import json
 import datetime
 import yfinance as yf
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 st.set_page_config(page_title="Wise Finvestors", layout="wide")
 
 # --- GOOGLE SHEETS CONNECTOR ---
 @st.cache_resource
 def get_gspread_client():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    sec = st.secrets["gcp_service_account"]
-    if "json_key" in sec:
-        creds_dict = json.loads(sec["json_key"])
-    else:
-        creds_dict = dict(sec)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    return gspread.authorize(creds)
+    # Streamlit's official gspread authentication
+    return gspread.service_account_from_dict(st.secrets["gcp_service_account"])
 
 connected = False
 sheet_trans = None
@@ -33,6 +26,7 @@ try:
     connected = True
 except Exception as e:
     connected = False
+    st.error(f"⚠️ Connection Detail Error: {e}")
 
 # --- FETCH USERS FROM GOOGLE SHEET ---
 USERS = {}
