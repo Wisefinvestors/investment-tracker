@@ -6,20 +6,27 @@ import yfinance as yf
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-st.set_page_config(page_title="Partnership Investment Tracker", layout="wide")
+st.set_page_config(page_title="Wise Finvestors", layout="wide")
 
-# --- GOOGLE SHEETS CONNECTOR ---
 # --- GOOGLE SHEETS CONNECTOR ---
 @st.cache_resource
 def get_gspread_client():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    # Secrets support for triple quote json_key
-    if "json_key" in st.secrets["gcp_service_account"]:
-        creds_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    sec = st.secrets["gcp_service_account"]
+    if "json_key" in sec:
+        creds_dict = json.loads(sec["json_key"])
     else:
-        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds_dict = dict(sec)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     return gspread.authorize(creds)
+
+connected = False
+sheet_trans = None
+sheet_users = None
+sheet_paper = None
+
+try:
+    client = get_gspread_client()
     sheet_trans = client.open("Investment_Database").worksheet("Transactions")
     sheet_users = client.open("Investment_Database").worksheet("Users_List")
     sheet_paper = client.open("Investment_Database").worksheet("Paper_Trades")
@@ -29,16 +36,17 @@ except Exception as e:
 
 # --- FETCH USERS FROM GOOGLE SHEET ---
 USERS = {}
-if connected:
+if connected and sheet_users:
     try:
         user_records = sheet_users.get_all_records()
         for row in user_records:
-            USERS[str(row["Mobile"])] = {
-                "name": str(row["Name"]),
-                "pin": str(row["PIN"]),
+            mob = str(row["Mobile"]).strip()
+            USERS[mob] = {
+                "name": str(row["Name"]).strip(),
+                "pin": str(row["PIN"]).strip(),
                 "default_rate": float(row.get("Interest_Rate", 10.0))
             }
-    except Exception:
+    except Exception as e:
         pass
 
 if not USERS:
@@ -50,12 +58,18 @@ if "logged_in" not in st.session_state:
     st.session_state.current_user = None
 
 if not st.session_state.logged_in:
-    st.title("🔐 Login - Investment Partnership")
-    mobile = st.text_input("Mobile Number")
-    pin = st.text_input("PIN / Password", type="password")
+    st.title("🔐 Login - Wise Finvestors")
+    
+    if connected:
+        st.success("🟢 Connected to Google Sheet Database")
+    else:
+        st.warning("⚠️ Sheet Connection Pending. Using Fallback Login.")
+        
+    mobile = st.text_input("Mobile Number").strip()
+    pin = st.text_input("PIN / Password", type="password").strip()
     
     if st.button("Login"):
-        if mobile in USERS and str(USERS[mobile]["pin"]) == pin:
+        if mobile in USERS and USERS[mobile]["pin"] == pin:
             st.session_state.logged_in = True
             st.session_state.current_user = USERS[mobile]["name"]
             st.session_state.user_rate = USERS[mobile]["default_rate"]
@@ -70,7 +84,7 @@ if st.sidebar.button("Logout"):
     st.session_state.logged_in = False
     st.rerun()
 
-st.title("📈 Partnership Investment Dashboard")
+st.title("📈 Wise Finvestors")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Real Investments", 
@@ -95,7 +109,7 @@ with tab1:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             new_row = [timestamp, str(inv_date), user, asset_type, amount, interest_rate, note]
             
-            if connected:
+            if connected and sheet_trans:
                 sheet_trans.append_row(new_row)
                 st.success(f"Saved to Google Sheet & tagged to **{user}** @ {interest_rate}% Interest!")
             else:
@@ -117,14 +131,14 @@ with tab2:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             p_row = [timestamp, user, p_ticker, p_buy, p_qty, "OPEN"]
             
-            if connected:
+            if connected and sheet_paper:
                 sheet_paper.append_row(p_row)
                 st.success(f"Virtual Paper Trade recorded for **{user}**!")
 
 # --- TAB 3: JSON EXPORT ---
 with tab3:
     st.subheader("📦 Database JSON Export")
-    if connected:
+    if connected and sheet_trans:
         try:
             records = sheet_trans.get_all_records()
             json_data = json.dumps(records, indent=4)
